@@ -1,0 +1,33 @@
+{
+  "id": "life-tether-spell",
+  "title": "Life Tether",
+  "description": "Automated Life Tether spell for Foundry VTT (D&D 5e) with visual beam effects (Sequencer/JB2A), damage redirection (Midi-QOL), and line-of-sight tracking.",
+  "version": "1.0.0",
+  "compatibility": {
+    "minimum": "11",
+    "verified": "12"
+  },
+  "authors": [
+    {
+      "name": "faibai02"
+    }
+  ],
+  "esmodules": [
+    "scripts/life-tether.js"
+  ],
+  "relationships": {
+    "requires": [
+      {
+        "id": "midi-qol",
+        "type": "module"
+      },
+      {
+        "id": "sequencer",
+        "type": "module"
+      }
+    ]
+  },
+  "url": "https://github.com/faibai02/Foundry-Life-Tether",
+  "manifest": "https://raw.githubusercontent.com/faibai02/Foundry-Life-Tether/main/module.json",
+  "download": "https://github.com/faibai02/Foundry-Life-Tether/releases/download/{{version}}/life-tether-spell.zip"
+}
