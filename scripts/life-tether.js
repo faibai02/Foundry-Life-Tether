@@ -329,14 +329,20 @@ Hooks.on("midi-qol.RollComplete", async (workflow) => {
       const beamFile = getTetherBeamFile();
       if (beamFile) {
         console.log(`[${MODULE_ID}] Starte Sequencer-Strahl mit Asset: ${beamFile}`);
-        new Sequence()
-          .effect()
-            .file(beamFile)
-            .attachTo(casterToken, { bindVisibility: false })
-            .stretchTo(targetToken, { attachTo: true, bindVisibility: false })
-            .persist()
-            .name(effectTag)
-          .play();
+        const sequence = new Sequence();
+        const effect = sequence.effect()
+          .file(beamFile)
+          .attachTo(casterToken, { bindVisibility: false })
+          .stretchTo(targetToken, { attachTo: true, bindVisibility: false })
+          .persist()
+          .name(effectTag);
+
+        // Transform non-green assets (such as JB2A Free blue beam) into vibrant necrotic green
+        if (!beamFile.toLowerCase().includes("green")) {
+          effect.tint("#00ff55");
+        }
+
+        sequence.play();
       } else {
         console.warn(`[${MODULE_ID}] Kein JB2A Strahl-Asset im Sequencer-Katalog gefunden.`);
         ui.notifications.warn(`Life Tether: Kein JB2A Strahl-Effekt gefunden. Installiere das Modul JB2A (Free oder Patreon) für die Animation.`);
