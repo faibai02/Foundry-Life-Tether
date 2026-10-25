@@ -10,8 +10,8 @@
  * - True 50% damage reduction on caster via midi-qol.preTargetDamageApplication
  * - Target damage transfer requiring DM acceptance (via Midi-QOL damage card buttons or 1-click DM button)
  * - Visual damage surge animation: tether blinks crimson red when damage is applied to the enemy
+ * - Line-of-sight check with DM choice buttons: break concentration or allow/ignore line of sight
  * - Manual damage reduction fallback via dnd5e.preApplyDamage
- * - Real-time Line-of-sight tracking via wall collision detection
  * - Clean cleanup of effects and visuals on expiration or manual deletion
  */
 
@@ -152,6 +152,73 @@ async function removeEffectSafely(actor, effectId) {
   } catch (err) {
     console.error(`[${MODULE_ID}] Fehler beim Löschen des ActiveEffects auf ${actor.name}:`, err);
   }
+}
+
+/**
+ * Breaks concentration and ends the tether between caster and target.
+ */
+async function breakTether(casterTokenId, targetTokenId) {
+  const casterToken = canvas.tokens.get(casterTokenId);
+  const targetToken = canvas.tokens.get(targetTokenId);
+
+  // 1. Remove tether effect from Caster
+  if (casterToken?.actor) {
+    const casterEffects = casterToken.actor.effects.filter(e =>
+      e.getFlag(MODULE_ID, "isCaster") && e.getFlag(MODULE_ID, "targetTokenId") === targetTokenId
+    );
+    for (const eff of casterEffects) {
+      await removeEffectSafely(casterToken.actor, eff.id);
+    }
+
+    // Check for D&D 5e / Midi-QOL concentration effect if all tethers are broken
+    const remainingTethers = casterToken.actor.effects.filter(e => e.getFlag(MODULE_ID, "isCaster"));
+    if (remainingTethers.length === 0) {
+      const concEffect = casterToken.actor.effects.find(e =>
+        e.name?.toLowerCase().includes("concentration") ||
+        e.statuses?.has("concentrating") ||
+        e.getFlag("dnd5e", "concentration")
+      );
+      if (concEffect) {
+        await removeEffectSafely(casterToken.actor, concEffect.id);
+      }
+    }
+  }
+
+  // 2. Remove tether effect from Target
+  if (targetToken?.actor) {
+    const targetEffects = targetToken.actor.effects.filter(e =>
+      e.getFlag(MODULE_ID, "isTarget") && e.getFlag(MODULE_ID, "casterTokenId") === casterTokenId
+    );
+    for (const eff of targetEffects) {
+      await removeEffectSafely(targetToken.actor, eff.id);
+    }
+  }
+
+  // 3. Clean up Sequencer beam
+  const tag = `life-tether-${casterTokenId}-${targetTokenId}`;
+  if (game.modules.get("sequencer")?.active && typeof Sequencer !== "undefined") {
+    Sequencer.EffectManager.endEffects({ name: tag });
+  }
+
+  // 4. Reset LoS tracker
+  const pairKey = [casterTokenId, targetTokenId].sort().join("-");
+  losWarningTracker.delete(pairKey);
+
+  const casterName = casterToken?.name ?? "Zaubernder";
+  const targetName = targetToken?.name ?? "Ziel";
+
+  ChatMessage.create({
+    content: `
+      <div class="dnd5e chat-card">
+        <header class="card-header flexrow">
+          <h3 class="item-name" style="color: #b71c1c;">✂️ Konzentration abgebrochen</h3>
+        </header>
+        <div class="card-content">
+          <p>Der Spielleiter hat die Konzentration beendet. Der Lebensfaden zwischen <b>${casterName}</b> und <b>${targetName}</b> wurde getrennt.</p>
+        </div>
+      </div>
+    `
+  });
 }
 
 /**
@@ -512,40 +579,82 @@ Hooks.on("midi-qol.preTargetDamageApplication", async (token, { item, workflow, 
 });
 
 /**
- * Handle clicks on the DM damage acceptance button in chat.
+ * Handle clicks on interactive buttons in chat (Damage Apply, Break Concentration, Allow LoS).
  */
 Hooks.on("renderChatMessage", (message, html) => {
   const root = html instanceof HTMLElement ? html : html[0];
   if (!root) return;
 
-  const btn = root.querySelector(".life-tether-apply-btn");
-  if (!btn) return;
+  // 1. Damage Acceptance Button
+  const applyBtn = root.querySelector(".life-tether-apply-btn");
+  if (applyBtn) {
+    if (!game.user.isGM) {
+      applyBtn.disabled = true;
+      applyBtn.title = "Nur der Spielleiter (DM) kann diesen Schaden bestätigen.";
+      applyBtn.style.opacity = "0.6";
+      applyBtn.style.cursor = "not-allowed";
+    } else {
+      applyBtn.addEventListener("click", async (event) => {
+        event.preventDefault();
+        applyBtn.disabled = true;
+        const targetId = applyBtn.dataset.targetId;
+        const casterId = applyBtn.dataset.casterId;
+        const damage = parseInt(applyBtn.dataset.damage, 10);
+        const targetToken = canvas.tokens.get(targetId);
+        const casterToken = canvas.tokens.get(casterId);
 
-  // Non-DMs cannot accept or apply damage
-  if (!game.user.isGM) {
-    btn.disabled = true;
-    btn.title = "Nur der Spielleiter (DM) kann diesen Schaden bestätigen.";
-    btn.style.opacity = "0.6";
-    btn.style.cursor = "not-allowed";
-    return;
+        if (targetToken) {
+          await applyDirectDamage(targetToken, damage, "necrotic", casterToken);
+          applyBtn.innerText = `✓ ${damage} Schaden angewendet`;
+          applyBtn.style.backgroundColor = "#2e7d32";
+          applyBtn.style.color = "#ffffff";
+        }
+      });
+    }
   }
 
-  btn.addEventListener("click", async (event) => {
-    event.preventDefault();
-    btn.disabled = true;
-    const targetId = btn.dataset.targetId;
-    const casterId = btn.dataset.casterId;
-    const damage = parseInt(btn.dataset.damage, 10);
-    const targetToken = canvas.tokens.get(targetId);
-    const casterToken = canvas.tokens.get(casterId);
+  // 2. Line of Sight - Break Concentration Button
+  const breakBtn = root.querySelector(".life-tether-break-btn");
+  if (breakBtn) {
+    if (!game.user.isGM) {
+      breakBtn.disabled = true;
+      breakBtn.title = "Nur der Spielleiter (DM) kann diese Aktion ausführen.";
+      breakBtn.style.opacity = "0.6";
+      breakBtn.style.cursor = "not-allowed";
+    } else {
+      breakBtn.addEventListener("click", async (event) => {
+        event.preventDefault();
+        const container = breakBtn.closest(".card-buttons") || breakBtn.parentElement;
+        const casterId = breakBtn.dataset.casterId;
+        const targetId = breakBtn.dataset.targetId;
 
-    if (targetToken) {
-      await applyDirectDamage(targetToken, damage, "necrotic", casterToken);
-      btn.innerText = `✓ ${damage} Schaden angewendet`;
-      btn.style.backgroundColor = "#2e7d32";
-      btn.style.color = "#ffffff";
+        await breakTether(casterId, targetId);
+
+        if (container) {
+          container.innerHTML = `<div style="color: #b71c1c; font-weight: bold; text-align: center; padding: 4px;">✂️ Konzentration abgebrochen: Tether wurde beendet.</div>`;
+        }
+      });
     }
-  });
+  }
+
+  // 3. Line of Sight - Allow / Ignore Button
+  const allowBtn = root.querySelector(".life-tether-allow-btn");
+  if (allowBtn) {
+    if (!game.user.isGM) {
+      allowBtn.disabled = true;
+      allowBtn.title = "Nur der Spielleiter (DM) kann diese Aktion ausführen.";
+      allowBtn.style.opacity = "0.6";
+      allowBtn.style.cursor = "not-allowed";
+    } else {
+      allowBtn.addEventListener("click", (event) => {
+        event.preventDefault();
+        const container = allowBtn.closest(".card-buttons") || allowBtn.parentElement;
+        if (container) {
+          container.innerHTML = `<div style="color: #2e7d32; font-weight: bold; text-align: center; padding: 4px;">✓ Sichtlinie vom DM erlaubt (ignoriert).</div>`;
+        }
+      });
+    }
+  }
 });
 
 /**
@@ -629,6 +738,7 @@ Hooks.on("dnd5e.preApplyDamage", (actor, amount, updates, options) => {
 
 /**
  * 4. Line-of-Sight Check: updateToken
+ * Triggers interactive alert when walls block line of sight between tethered tokens.
  */
 Hooks.on("updateToken", (tokenDocument, change, options, userId) => {
   if (change.x === undefined && change.y === undefined) return;
@@ -650,6 +760,9 @@ Hooks.on("updateToken", (tokenDocument, change, options, userId) => {
     const otherToken = canvas.tokens.get(otherTokenId);
     if (!otherToken) continue;
 
+    const casterTokenId = flagData.isCaster ? token.id : otherToken.id;
+    const targetTokenId = flagData.isCaster ? otherToken.id : token.id;
+
     const pairKey = [token.id, otherToken.id].sort().join("-");
     const ray = new Ray(token.center, otherToken.center);
 
@@ -668,9 +781,20 @@ Hooks.on("updateToken", (tokenDocument, change, options, userId) => {
         speaker: ChatMessage.getSpeaker({ token }),
         content: `
           <div class="dnd5e chat-card">
+            <header class="card-header flexrow">
+              <h3 class="item-name" style="color: #b00020;">⚠️ Life Tether: Sichtlinie unterbrochen!</h3>
+            </header>
             <div class="card-content">
-              <p style="color: #b00020;"><strong>⚠️ Life Tether: Sichtlinie unterbrochen!</strong></p>
               <p>Die Sichtlinie zwischen <b>${token.name}</b> und <b>${otherToken.name}</b> wird durch eine Wand blockiert!</p>
+              <p style="font-size: 0.9em; color: #555;"><em>Entscheidung des Spielleiters (DM):</em></p>
+            </div>
+            <div class="card-buttons" style="display: flex; gap: 6px; margin-top: 8px;">
+              <button type="button" class="life-tether-break-btn" data-caster-id="${casterTokenId}" data-target-id="${targetTokenId}" style="flex: 1; padding: 6px; background-color: #b71c1c; color: white; border: none; border-radius: 3px; cursor: pointer; font-weight: bold;">
+                ✂️ Konzentration abbrechen
+              </button>
+              <button type="button" class="life-tether-allow-btn" data-caster-id="${casterTokenId}" data-target-id="${targetTokenId}" style="flex: 1; padding: 6px; background-color: #2e7d32; color: white; border: none; border-radius: 3px; cursor: pointer; font-weight: bold;">
+                👁️ Sichtlinie erlauben
+              </button>
             </div>
           </div>
         `
