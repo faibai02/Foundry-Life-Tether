@@ -280,7 +280,7 @@ Hooks.on("midi-qol.RollComplete", async (workflow) => {
           .effect()
             .file(beamFile)
             .attachTo(casterToken, { bindVisibility: false })
-            .stretchTo(targetToken, { bindVisibility: false })
+            .stretchTo(targetToken, { attachTo: true, bindVisibility: false })
             .persist()
             .name(effectTag)
           .play();
