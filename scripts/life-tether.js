@@ -7,6 +7,7 @@
  * - Cross-client ActiveEffect creation via GM delegation
  * - Dynamic visual beam using Sequencer & JB2A (supporting Patreon Green, Free Blue, and dynamic search)
  * - True 50% damage reduction on caster and direct necrotic redirection to target(s) via midi-qol.preTargetDamageApplication
+ * - Direct HP damage deduction on tethered target using Midi-QOL / D&D 5e damage application
  * - Manual damage reduction fallback via dnd5e.preApplyDamage
  * - Real-time Line-of-sight tracking via wall collision detection
  * - Clean cleanup of effects and visuals on expiration or manual deletion
@@ -75,13 +76,11 @@ function getTetherBeamFile() {
 async function createEffectSafely(actor, effectData) {
   if (!actor) return null;
 
-  // If current user has permission to update actor directly:
   if (actor.canUserModify(game.user, "update")) {
     const created = await actor.createEmbeddedDocuments("ActiveEffect", [effectData]);
     return created?.[0] ?? null;
   }
 
-  // If Midi-QOL socket is available, execute through GM:
   if (globalThis.MidiQOL?.socket) {
     return await globalThis.MidiQOL.socket().executeAsGM("createEffects", {
       actorUuid: actor.uuid,
@@ -89,7 +88,6 @@ async function createEffectSafely(actor, effectData) {
     });
   }
 
-  // Fallback: direct attempt
   try {
     const created = await actor.createEmbeddedDocuments("ActiveEffect", [effectData]);
     return created?.[0] ?? null;
@@ -129,13 +127,68 @@ async function removeEffectSafely(actor, effectId) {
 }
 
 /**
+ * Safely applies damage directly to a target token actor so HP is actually deducted.
+ * Supports Midi-QOL applyTokenDamage, D&D 5e actor.applyDamage, and GM-delegated updates.
+ */
+async function applyDirectDamage(targetToken, amount, damageType = "necrotic") {
+  if (!targetToken?.actor || amount <= 0) return;
+  const targetActor = targetToken.actor;
+
+  // 1. Midi-QOL applyTokenDamage: factors in resistances/immunities and commits damage directly to HP
+  if (typeof globalThis.MidiQOL?.applyTokenDamage === "function") {
+    try {
+      await globalThis.MidiQOL.applyTokenDamage(
+        [{ damage: amount, type: damageType }],
+        amount,
+        new Set([targetToken.document ?? targetToken]),
+        null,
+        new Set(),
+        {
+          forceApply: true,
+          updateContext: { [MODULE_ID]: { isDamageTransfer: true } }
+        }
+      );
+      return;
+    } catch (err) {
+      console.warn(`[${MODULE_ID}] MidiQOL.applyTokenDamage fehlgeschlagen, versuche actor.applyDamage:`, err);
+    }
+  }
+
+  // 2. D&D 5e native actor.applyDamage
+  if (typeof targetActor.applyDamage === "function") {
+    try {
+      await targetActor.applyDamage([{ value: amount, type: damageType }]);
+      return;
+    } catch (err) {
+      console.warn(`[${MODULE_ID}] targetActor.applyDamage fehlgeschlagen:`, err);
+    }
+  }
+
+  // 3. Direct HP calculation fallback
+  const currentHp = targetActor.system.attributes?.hp?.value ?? 0;
+  const newHp = Math.max(0, currentHp - amount);
+  if (targetActor.canUserModify(game.user, "update")) {
+    await targetActor.update({ "system.attributes.hp.value": newHp });
+  } else if (globalThis.MidiQOL?.socket) {
+    await globalThis.MidiQOL.socket().executeAsGM("updateActor", {
+      actorUuid: targetActor.uuid,
+      updates: { "system.attributes.hp.value": newHp }
+    });
+  }
+}
+
+/**
  * 1. Spell Cast & Target Assignment: midi-qol.RollComplete
  * Triggers after the spell roll and saves have completed.
  */
 Hooks.on("midi-qol.RollComplete", async (workflow) => {
   if (!workflow.item) return;
 
+  // Prevent damage transfer items or sub-workflows from triggering the spell activation
+  if (workflow.item.flags?.[MODULE_ID]?.isDamageTransfer) return;
   const rawItemName = workflow.item.name?.trim().toLowerCase() ?? "";
+  if (rawItemName.includes("übertragung") || rawItemName.includes("transfer")) return;
+
   const isLifeTether = SPELL_NAMES.some(name => rawItemName.includes(name)) ||
     Boolean(workflow.item.flags?.[MODULE_ID]?.isLifeTether);
 
@@ -313,7 +366,7 @@ Hooks.on("midi-qol.RollComplete", async (workflow) => {
  * 2. True Damage Redirection: midi-qol.preTargetDamageApplication
  * Intercepts incoming damage on the caster BEFORE it is applied:
  * - Halves incoming damage on the caster (50% reduction).
- * - Redirects the 50% as necrotic damage to all active tethered targets.
+ * - Directly inflicts the 50% as necrotic damage on the target token's HP.
  */
 Hooks.on("midi-qol.preTargetDamageApplication", async (token, { item, workflow, damageItem }) => {
   // Prevent infinite loops if our own transfer damage is being applied
@@ -360,42 +413,14 @@ Hooks.on("midi-qol.preTargetDamageApplication", async (token, { item, workflow, 
     }
   }
 
-  // Process necrotic damage transfer for each tethered target
+  // Process necrotic damage transfer directly to each tethered target's HP
   for (const effect of casterEffects) {
     const targetTokenId = effect.getFlag(MODULE_ID, "targetTokenId");
     const targetToken = canvas.tokens.get(targetTokenId);
     if (!targetToken || !targetToken.actor) continue;
 
-    const targetActor = targetToken.actor;
-
-    if (globalThis.MidiQOL?.DamageOnlyWorkflow) {
-      const damageRoll = await new Roll(`${transferDamage}`).evaluate();
-      new MidiQOL.DamageOnlyWorkflow(
-        actor,
-        token,
-        transferDamage,
-        "necrotic",
-        [targetToken],
-        damageRoll,
-        {
-          flavor: `Life Tether Übertragung (50% von ${incomingDamage} Schaden)`,
-          itemCardId: "new",
-          itemData: {
-            name: "Life Tether Übertragung",
-            type: "feat",
-            img: "icons/magic/death/hand-dirt-undead-zombie.webp",
-            flags: {
-              [MODULE_ID]: { isDamageTransfer: true }
-            }
-          }
-        }
-      );
-    } else if (typeof targetActor.applyDamage === "function") {
-      await targetActor.applyDamage([{ value: transferDamage, type: "necrotic" }]);
-    } else {
-      const currentHp = targetActor.system.attributes?.hp?.value ?? 0;
-      await targetActor.update({ "system.attributes.hp.value": Math.max(0, currentHp - transferDamage) });
-    }
+    // Apply the damage directly so HP is actually deducted from the target
+    await applyDirectDamage(targetToken, transferDamage, "necrotic");
 
     ChatMessage.create({
       speaker: ChatMessage.getSpeaker({ token }),
@@ -444,6 +469,15 @@ Hooks.on("dnd5e.preApplyDamage", (actor, amount, updates, options) => {
       actor.system.attributes.hp.max,
       updates["system.attributes.hp.value"] + hpReduction
     );
+  }
+
+  // Also apply damage to tethered target in direct manual mode
+  for (const effect of casterEffects) {
+    const targetTokenId = effect.getFlag(MODULE_ID, "targetTokenId");
+    const targetToken = canvas.tokens.get(targetTokenId);
+    if (targetToken) {
+      applyDirectDamage(targetToken, transferDamage, "necrotic");
+    }
   }
 
   console.log(`[${MODULE_ID}] dnd5e.preApplyDamage manuell abgefangen: Caster ${actor.name} Schadensreduktion von ${totalDamage} auf ${newCasterDamage}.`);
