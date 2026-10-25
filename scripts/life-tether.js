@@ -9,6 +9,7 @@
  * - Dynamic position updating: beam tracks both tokens continuously via { attachTo: true }
  * - True 50% damage reduction on caster via midi-qol.preTargetDamageApplication
  * - Target damage transfer requiring DM acceptance (via Midi-QOL damage card buttons or 1-click DM button)
+ * - Visual damage surge animation: tether blinks crimson red when damage is applied to the enemy
  * - Manual damage reduction fallback via dnd5e.preApplyDamage
  * - Real-time Line-of-sight tracking via wall collision detection
  * - Clean cleanup of effects and visuals on expiration or manual deletion
@@ -72,6 +73,32 @@ function getTetherBeamFile() {
 }
 
 /**
+ * Plays a damage transfer pulse along the tether, blinking crimson red for ~700ms
+ * to visually represent the energy and damage surging from caster to target.
+ */
+function playDamageTransferPulse(casterToken, targetToken) {
+  if (!game.modules.get("sequencer")?.active || typeof Sequence !== "function") return;
+  if (!casterToken || !targetToken) return;
+
+  const beamFile = getTetherBeamFile();
+  if (!beamFile) return;
+
+  console.log(`[${MODULE_ID}] Schadensübertragungs-Impuls: Roter Strahl-Blitz zwischen ${casterToken.name} und ${targetToken.name}`);
+
+  new Sequence()
+    .effect()
+      .file(beamFile)
+      .attachTo(casterToken, { bindVisibility: false })
+      .stretchTo(targetToken, { attachTo: true, bindVisibility: false })
+      .tint("#ff0000") // Vibrant damage red
+      .duration(700)
+      .fadeIn(80)
+      .fadeOut(300)
+      .zIndex(10)
+    .play();
+}
+
+/**
  * Safely creates an ActiveEffect on an actor across client permission boundaries.
  */
 async function createEffectSafely(actor, effectData) {
@@ -128,11 +155,24 @@ async function removeEffectSafely(actor, effectId) {
 }
 
 /**
- * Applies damage directly to a target token actor once accepted by the DM.
+ * Applies damage directly to a target token actor once accepted by the DM
+ * and triggers the visual red damage pulse.
  */
-async function applyDirectDamage(targetToken, amount, damageType = "necrotic") {
+async function applyDirectDamage(targetToken, amount, damageType = "necrotic", casterToken = null) {
   if (!targetToken?.actor || amount <= 0) return;
   const targetActor = targetToken.actor;
+
+  // Resolve casterToken if not directly provided
+  if (!casterToken) {
+    const targetEffect = targetActor.effects.find(e => !e.disabled && e.getFlag(MODULE_ID, "isTarget"));
+    const casterId = targetEffect?.getFlag(MODULE_ID, "casterTokenId");
+    casterToken = canvas.tokens.get(casterId);
+  }
+
+  // Animate the tether line red to indicate the damage transfer!
+  if (casterToken) {
+    playDamageTransferPulse(casterToken, targetToken);
+  }
 
   // 1. Midi-QOL applyTokenDamage: factors in resistances/immunities and commits damage directly to HP
   if (typeof globalThis.MidiQOL?.applyTokenDamage === "function") {
@@ -459,7 +499,7 @@ Hooks.on("midi-qol.preTargetDamageApplication", async (token, { item, workflow, 
             <p style="font-size: 0.9em; color: #555;"><em>Erfordert DM-Bestätigung (über die Karte oben oder den Button unten):</em></p>
           </div>
           <div class="card-buttons" style="margin-top: 6px;">
-            <button type="button" class="life-tether-apply-btn" data-target-id="${targetToken.id}" data-damage="${transferDamage}" style="width: 100%; font-weight: bold; cursor: pointer; padding: 6px;">
+            <button type="button" class="life-tether-apply-btn" data-target-id="${targetToken.id}" data-caster-id="${token.id}" data-damage="${transferDamage}" style="width: 100%; font-weight: bold; cursor: pointer; padding: 6px;">
               💥 ${transferDamage} Schaden auf ${targetToken.name} anwenden
             </button>
           </div>
@@ -494,16 +534,38 @@ Hooks.on("renderChatMessage", (message, html) => {
     event.preventDefault();
     btn.disabled = true;
     const targetId = btn.dataset.targetId;
+    const casterId = btn.dataset.casterId;
     const damage = parseInt(btn.dataset.damage, 10);
     const targetToken = canvas.tokens.get(targetId);
+    const casterToken = canvas.tokens.get(casterId);
 
     if (targetToken) {
-      await applyDirectDamage(targetToken, damage, "necrotic");
+      await applyDirectDamage(targetToken, damage, "necrotic", casterToken);
       btn.innerText = `✓ ${damage} Schaden angewendet`;
       btn.style.backgroundColor = "#2e7d32";
       btn.style.color = "#ffffff";
     }
   });
+});
+
+/**
+ * Listens for damage applied via the Midi-QOL card button and triggers the red surge pulse.
+ */
+Hooks.on("dnd5e.applyDamage", (actor, amount, options) => {
+  const isTransfer = options?.midi?.item?.flags?.[MODULE_ID]?.isDamageTransfer ||
+    options?.[MODULE_ID]?.isDamageTransfer;
+  if (!isTransfer) return;
+
+  const targetToken = actor.token?.object ?? actor.getActiveTokens()[0];
+  if (!targetToken) return;
+
+  const targetEffect = actor.effects.find(e => !e.disabled && e.getFlag(MODULE_ID, "isTarget"));
+  const casterId = targetEffect?.getFlag(MODULE_ID, "casterTokenId");
+  const casterToken = canvas.tokens.get(casterId);
+
+  if (casterToken) {
+    playDamageTransferPulse(casterToken, targetToken);
+  }
 });
 
 /**
@@ -540,6 +602,8 @@ Hooks.on("dnd5e.preApplyDamage", (actor, amount, updates, options) => {
     const targetToken = canvas.tokens.get(targetTokenId);
     if (!targetToken) continue;
 
+    const casterToken = canvas.tokens.get(effect.getFlag(MODULE_ID, "casterTokenId"));
+
     ChatMessage.create({
       content: `
         <div class="dnd5e chat-card">
@@ -551,7 +615,7 @@ Hooks.on("dnd5e.preApplyDamage", (actor, amount, updates, options) => {
             <p><b>${transferDamage}</b> nekrotischer Schaden wartet auf Bestätigung für <b>${targetToken.name}</b>.</p>
           </div>
           <div class="card-buttons" style="margin-top: 6px;">
-            <button type="button" class="life-tether-apply-btn" data-target-id="${targetToken.id}" data-damage="${transferDamage}" style="width: 100%; font-weight: bold; cursor: pointer; padding: 6px;">
+            <button type="button" class="life-tether-apply-btn" data-target-id="${targetToken.id}" data-caster-id="${casterToken?.id ?? ''}" data-damage="${transferDamage}" style="width: 100%; font-weight: bold; cursor: pointer; padding: 6px;">
               💥 ${transferDamage} Schaden auf ${targetToken.name} anwenden
             </button>
           </div>
